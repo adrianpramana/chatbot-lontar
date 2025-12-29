@@ -1,2 +1,2 @@
-#ignore env
+# Mengabaikan file .env
 .env
