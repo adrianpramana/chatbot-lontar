@@ -1,3 +1,4 @@
+# Melakukan import library yang dibutuhkan
 import os
 import gradio as gr
 from dotenv import load_dotenv
@@ -11,7 +12,7 @@ from langchain_core.documents import Document
 # --- ELASTICSEARCH CLIENT ---
 from elasticsearch import Elasticsearch
 
-# 1. SETUP CONFIG
+# Memuat konfigurasi dari .env dan path dasar
 load_dotenv()
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 VECTOR_STORE_PATH = os.path.join(BASE_DIR, 'vector_store')
@@ -20,19 +21,20 @@ VECTOR_STORE_PATH = os.path.join(BASE_DIR, 'vector_store')
 ES_CLIENT = Elasticsearch("http://localhost:9200")
 # Note: Tambahkan auth/password disini jika setup ES Anda menggunakan security.
 
+# NAMA INDEX ELASTICSEARCH
 ES_INDEX_NAME = "lontar_knowledge_base"
 MODEL_NAME = "gemma2:2b"
 
 print(f"🚀 Memulai Sistem Lontar AI (Model: {MODEL_NAME})...")
 
-# 2. LOAD RESOURCES
+# Embedding Model & Cek Kesiapan Database
 embeddings = HuggingFaceEmbeddings(
     model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 )
 vector_db = None
 ES_READY = False
 
-# Cek FAISS
+# Cek FAISS Vector Store
 if os.path.exists(VECTOR_STORE_PATH):
     try:
         vector_db = FAISS.load_local(
@@ -53,12 +55,14 @@ except Exception as e:
 # Setup LLM
 llm = ChatOllama(model=MODEL_NAME, temperature=0.2, keep_alive="1h")
 
-# --- 3. LOGIKA SEARCH (QUERY DSL) ---
+# Mendefinisikan fungsi untuk pemahaman query
 
 
 def query_understanding(query):
     # (Logika sama: membersihkan query user)
     return query
+
+# Fungsi untuk pencarian di Elasticsearch secara aktual untuk lexical search
 
 
 def search_elastic_real(query_str, k=3):
@@ -91,6 +95,7 @@ def search_elastic_real(query_str, k=3):
         }
     }
 
+    # Eksekusi Query ke Elasticsearch
     try:
         response = ES_CLIENT.search(index=ES_INDEX_NAME, body=body_query)
         hits = response['hits']['hits']
@@ -100,7 +105,7 @@ def search_elastic_real(query_str, k=3):
             source = hit['_source']
             score = hit['_score']
 
-            # Mapping kembali ke format LangChain Document
+            # Membuat Document dari hasil pencarian
             doc = Document(
                 page_content=source.get('content', ''),
                 metadata={
@@ -119,6 +124,8 @@ def search_elastic_real(query_str, k=3):
         print(f"Error Query ES: {e}")
         return []
 
+# Fungsi untuk retrieval hybrid (Elastic Search + FAISS)
+
 
 def retrieve_hybrid(query, k_semantic=4, k_lexical=3):
     if vector_db is None:
@@ -127,7 +134,7 @@ def retrieve_hybrid(query, k_semantic=4, k_lexical=3):
     docs_lexical = []
     docs_semantic = []
 
-    # 1. Lexical Search (Real Elasticsearch)
+    # 1. Lexical Search
     docs_lexical = search_elastic_real(query, k=k_lexical)
 
     # 2. Semantic Search (FAISS)
@@ -155,10 +162,8 @@ def retrieve_hybrid(query, k_semantic=4, k_lexical=3):
 
     return final_docs[:k_semantic+1]
 
-# --- 4. PIPELINE CHAT ---
-# (Fungsi ini SAMA PERSIS dengan sebelumnya, tidak diubah strukturnya)
 
-
+# fungsi pipeline yang menggabungkan semua langkah dan menghasilkan respons
 def chat_pipeline(user_input, history):
     if not user_input:
         yield history, ""
@@ -205,9 +210,7 @@ def chat_pipeline(user_input, history):
     log_buffer += "\n✍️ PROSES 3: GENERATING RESPONSE...\n"
     yield history, log_buffer
 
-    # Prompt Engineering: Academic Literature Style
-    # Fokus: Menghilangkan repetisi, gaya bahasa paper ilmiah, dan analisis mendalam.
-
+   # Menyusun system prompt dengan konteks dan instruksi penulisan yang ketat supaya jawaban sesuai gaya akademis dan filologis serta sesuai konteks lontar
     system_prompt = f"""PERAN:
 Anda adalah 'Asisten Filologi Digital', pakar Lontar Bali yang menulis dengan gaya akademis murni layaknya penyusun jurnal ilmiah atau paper. Jawaban Anda harus analitis, kaya diksi, dan menghindari pola kalimat yang monoton.
 
@@ -261,7 +264,7 @@ JAWABAN ANALISIS ILMIAH:"""
     yield history, log_buffer
 
 
-# --- 5. GUI GRADIO (TETAP SAMA) ---
+# Membuat antarmuka Gradio dan menjalankannya
 custom_css = """
 #chatbot { height: 600px !important; overflow: auto; border: 1px solid #e5e7eb; border-radius: 8px; }
 #log_panel { background-color: #f8fafc; font-family: monospace; font-size: 0.85em; }
@@ -269,8 +272,9 @@ custom_css = """
 theme = gr.themes.Soft(primary_hue="emerald", neutral_hue="slate").set(
     body_background_fill="#ffffff")
 
-with gr.Blocks(title="Lontar AI (Elasticsearch Version)") as demo:
-    gr.Markdown("# 🌿 Lontar AI Knowledge System (Powered by Elasticsearch)")
+with gr.Blocks(title="Lontar Chatbot | Made Adrian") as demo:
+    gr.Markdown(
+        "# 🌿 Lontar Chatbot Powered by Gemma2, FAISS, Elasticsearch | Created by I Made Adrian Astalina Pramana | S2 TI UNUD")
     with gr.Row():
         with gr.Column(scale=4):
             gr.Markdown("### Log Trace")

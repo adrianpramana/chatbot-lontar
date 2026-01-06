@@ -1,3 +1,4 @@
+# Melakukan import library yang diperlukan
 import os
 import time
 from langchain_community.document_loaders import JSONLoader
@@ -17,14 +18,10 @@ VECTOR_STORE_PATH = os.path.join(BASE_DIR, 'vector_store')
 # Jika default tanpa password (mode dev):
 ES_CLIENT = Elasticsearch("http://localhost:9200")
 
-# Jika menggunakan password (default Elastic 8.x ke atas):
-# ES_CLIENT = Elasticsearch(
-#     "https://localhost:9200",
-#     basic_auth=("elastic", "PASSWORD_ANDA_DISINI"),
-#     verify_certs=False
-# )
-
+# NAMA INDEX ELASTICSEARCH
 ES_INDEX_NAME = "lontar_knowledge_base"
+
+# Fungsi untuk mengekstrak metadata dari setiap record
 
 
 def metadata_func(record: dict, metadata: dict) -> dict:
@@ -49,6 +46,7 @@ def metadata_func(record: dict, metadata: dict) -> dict:
     return metadata
 
 
+# Fungsi untuk membuat index Elasticsearch dengan mapping khusus
 def setup_elastic_index():
     """
     Mendefinisikan Mapping dengan ANALYZER KHUSUS (Synonym Awareness).
@@ -104,11 +102,13 @@ def setup_elastic_index():
         }
     }
 
+    # Membuat index dengan setting di atas dan mapping khusus
     ES_CLIENT.indices.create(index=ES_INDEX_NAME, body=settings)
     print(
         f"✅ Index '{ES_INDEX_NAME}' berhasil dibuat dengan Mapping (Standard Elastic Search).")
 
 
+# Fungsi utama untuk menjalankan proses ingest data dan indexing
 def run_ingest():
     print("🚀 [1/3] Memulai Ingest Data Lontar (Mode: Real Elasticsearch)...")
 
@@ -139,7 +139,7 @@ def run_ingest():
     print("🔍 [3/3] Uploading ke Elasticsearch Local...")
     setup_elastic_index()
 
-    # Siapkan data untuk Bulk Insert
+    # Persiapan Data untuk Bulk Insert ke Elasticsearch
     actions = []
     for i, chunk in enumerate(chunks):
         doc_body = {
@@ -155,7 +155,7 @@ def run_ingest():
         }
         actions.append(doc_body)
 
-    # Eksekusi Bulk Insert (Cepat & Efisien)
+    # Bulk Insert ke Elasticsearch dan cek hasilnya
     helpers.bulk(ES_CLIENT, actions)
     print(
         f"   --> Berhasil mengupload {len(actions)} dokumen ke Elasticsearch.")
@@ -165,5 +165,6 @@ def run_ingest():
     print("🎉 Selesai! Database Hybrid (FAISS + Real Elasticsearch) siap.")
 
 
+# Menjalankan fungsi utama jika file ini dieksekusi langsung
 if __name__ == "__main__":
     run_ingest()
