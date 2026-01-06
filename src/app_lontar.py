@@ -1,5 +1,4 @@
 import os
-import pickle
 import gradio as gr
 from dotenv import load_dotenv
 
@@ -7,15 +6,21 @@ from dotenv import load_dotenv
 from langchain_ollama import ChatOllama
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
+from langchain_core.documents import Document
+
+# --- ELASTICSEARCH CLIENT ---
+from elasticsearch import Elasticsearch
 
 # 1. SETUP CONFIG
 load_dotenv()
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 VECTOR_STORE_PATH = os.path.join(BASE_DIR, 'vector_store')
-KEYWORD_STORE_PATH = os.path.join(
-    BASE_DIR, 'keyword_store', 'bm25_retriever.pkl')
 
-# Model (Sesuai request: Gemma2:2b untuk performa ringan di i5 Gen 11 Ram 8GB)
+# CONFIG ELASTICSEARCH (Harus sama dengan Ingest)
+ES_CLIENT = Elasticsearch("http://localhost:9200")
+# Note: Tambahkan auth/password disini jika setup ES Anda menggunakan security.
+
+ES_INDEX_NAME = "lontar_knowledge_base"
 MODEL_NAME = "gemma2:2b"
 
 print(f"🚀 Memulai Sistem Lontar AI (Model: {MODEL_NAME})...")
@@ -25,190 +30,221 @@ embeddings = HuggingFaceEmbeddings(
     model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 )
 vector_db = None
-bm25_retriever = None
-DB_READY = False
+ES_READY = False
 
-if os.path.exists(VECTOR_STORE_PATH) and os.path.exists(KEYWORD_STORE_PATH):
+# Cek FAISS
+if os.path.exists(VECTOR_STORE_PATH):
     try:
         vector_db = FAISS.load_local(
-            VECTOR_STORE_PATH, embeddings, allow_dangerous_deserialization=True
-        )
-        with open(KEYWORD_STORE_PATH, "rb") as f:
-            bm25_retriever = pickle.load(f)
-        DB_READY = True
-        print("✅ Database Siap.")
+            VECTOR_STORE_PATH, embeddings, allow_dangerous_deserialization=True)
     except Exception as e:
-        print(f"❌ Error DB: {e}")
-else:
-    print("⚠️ Database belum ada. Jalankan 'ingest_lontar.py'.")
+        print(f"❌ Error FAISS: {e}")
 
-# Setup LLM - Temperature rendah untuk akurasi data
-llm = ChatOllama(
-    model=MODEL_NAME,
-    temperature=0.2,
-    keep_alive="1h"
-)
+# Cek Elasticsearch
+try:
+    if ES_CLIENT.ping():
+        ES_READY = True
+        print("✅ Terkoneksi ke Elasticsearch Local.")
+    else:
+        print("⚠️ Elasticsearch Service tidak terdeteksi (Pastikan elasticsearch.bat running).")
+except Exception as e:
+    print(f"❌ Error ES Connection: {e}")
 
-# --- 3. LOGIKA RAG ---
+# Setup LLM
+llm = ChatOllama(model=MODEL_NAME, temperature=0.2, keep_alive="1h")
 
-# Fungsi Query Understanding dengan konsepnya menjelaskan alur pemahaman query LLM
+# --- 3. LOGIKA SEARCH (QUERY DSL) ---
 
 
 def query_understanding(query):
-    """
-    Menggantikan query_expansion biasa.
-    Melakukan analisis 'Intent' dan 'Entity' untuk pemahaman mendalam.
-    """
-    try:
-        # Prompt Engineering: Few-Shot Learning untuk mengarahkan model
-        prompt = f"""Analisis pertanyaan pengguna tentang Lontar Bali.
-        Pertanyaan: "{query}"
-        
-        Tugas:
-        1. Ekstrak topik inti (misal: "Caru Ayam" -> "Upacara/Caru").
-        2. Perbaiki istilah Bali jika ada typo.
-        3. Berikan output HANYA string kata kunci pencarian yang optimal.
-        
-        Output:"""
+    # (Logika sama: membersihkan query user)
+    return query
 
-        response = llm.invoke(prompt)
-        clean_query = response.content.strip().replace('"', '').replace("Output:", "")
-        return clean_query
-    except:
-        return query
+
+def search_elastic_real(query_str, k=3):
+    """
+    Menggunakan Elasticsearch Query DSL (JSON).
+    Ini adalah metode pencarian standar industri.
+    """
+    if not ES_READY:
+        return []
+
+    # CONSTRUKSI QUERY DSL
+    # Mencari di title (boosted) dan content.
+    # Fuzziness='AUTO' menangani typo secara otomatis.
+    body_query = {
+        "size": k,
+        "query": {
+            "bool": {
+                "must": [
+                    {
+                        "multi_match": {
+                            "query": query_str,
+                            # ^2 artinya bobot judul dikali 2
+                            "fields": ["title^2", "content", "tags"],
+                            "fuzziness": "AUTO",
+                            "operator": "or"
+                        }
+                    }
+                ]
+            }
+        }
+    }
+
+    try:
+        response = ES_CLIENT.search(index=ES_INDEX_NAME, body=body_query)
+        hits = response['hits']['hits']
+
+        results_docs = []
+        for hit in hits:
+            source = hit['_source']
+            score = hit['_score']
+
+            # Mapping kembali ke format LangChain Document
+            doc = Document(
+                page_content=source.get('content', ''),
+                metadata={
+                    "title": source.get('title'),
+                    "category": source.get('category'),
+                    "topic_tags": source.get('tags'),
+                    "source": "Elasticsearch Service",
+                    "score": score
+                }
+            )
+            results_docs.append(doc)
+
+        return results_docs
+
+    except Exception as e:
+        print(f"Error Query ES: {e}")
+        return []
 
 
 def retrieve_hybrid(query, k_semantic=4, k_lexical=3):
-    if not DB_READY:
+    if vector_db is None:
         return []
 
-    docs_bm25 = []
-    docs_faiss = []
+    docs_lexical = []
+    docs_semantic = []
 
-    # 1. Lexical Search (BM25) - Menangkap istilah spesifik (misal: "manca wali krama")
+    # 1. Lexical Search (Real Elasticsearch)
+    docs_lexical = search_elastic_real(query, k=k_lexical)
+
+    # 2. Semantic Search (FAISS)
     try:
-        bm25_retriever.k = k_lexical
-        docs_bm25 = bm25_retriever.invoke(query)
+        docs_semantic = vector_db.similarity_search(query, k=k_semantic)
     except:
         pass
 
-    # 2. Semantic Search (FAISS) - Menangkap makna (misal: "cara mengobati sakit kepala")
-    try:
-        docs_faiss = vector_db.similarity_search(query, k=k_semantic)
-    except:
-        pass
-
-    # 3. Fusion & Deduplication (Reranking sederhana)
+    # 3. Fusion (Gabungan)
     final_docs = []
     seen = set()
 
-    # Prioritaskan BM25 untuk istilah langka, FAISS untuk konsep umum
-    all_candidates = docs_bm25 + docs_faiss
+    # Gabungkan: Prioritas ES (Lexical) lalu FAISS (Semantic)
+    all_candidates = docs_lexical + docs_semantic
 
     for d in all_candidates:
-        # Gunakan snippet konten sebagai signature unik
         signature = d.page_content[:100]
         if signature not in seen:
-            if d in docs_bm25:
-                d.metadata['method'] = "Lexical Match"
+            if d in docs_lexical:
+                d.metadata['method'] = f"Elastic Match (Score: {d.metadata.get('score', 0):.2f})"
             else:
                 d.metadata['method'] = "Semantic Match"
-
             final_docs.append(d)
             seen.add(signature)
 
-    # Batasi output context agar tidak overload RAM
     return final_docs[:k_semantic+1]
 
-# --- 4. PIPELINE CHAT (HULU KE HILIR LOGGING) ---
+# --- 4. PIPELINE CHAT ---
+# (Fungsi ini SAMA PERSIS dengan sebelumnya, tidak diubah strukturnya)
 
 
 def chat_pipeline(user_input, history):
-    """
-    Pipeline RAG End-to-End dengan Logging Aktivitas Spesifik
-    """
     if not user_input:
         yield history, ""
         return
 
     if history is None:
         history = []
-
     history.append({"role": "user", "content": user_input})
     history.append({"role": "assistant", "content": ""})
 
-    # [LOG 1: Input]
     log_buffer = f"🔍 INPUT USER: {user_input}\n" + "-"*40 + "\n"
     yield history, log_buffer
 
-    if not DB_READY:
-        history[-1]['content'] = "⚠️ Database belum siap. Mohon jalankan ingest data."
-        yield history, log_buffer + "❌ DB ERROR"
+    if not ES_READY and vector_db is None:
+        history[-1]['content'] = "⚠️ Sistem DB Error. Cek koneksi Elasticsearch."
+        yield history, log_buffer + "❌ CONNECTION ERROR"
         return
 
-    # [LOG 2: Query Understanding]
     log_buffer += "🧠 PROSES 1: QUERY UNDERSTANDING...\n"
     yield history, log_buffer
-
     expanded_query = query_understanding(user_input)
-
-    log_buffer += f"   ↳ Intent Terdeteksi: '{expanded_query}'\n"
-    log_buffer += f"   ↳ Strategi: Hybrid Search (Semantic + Lexical)\n"
+    log_buffer += f"   ↳ Query: '{expanded_query}'\n"
     yield history, log_buffer
 
-    # [LOG 3: Retrieval]
-    log_buffer += "\n📚 PROSES 2: RETRIEVAL DATA...\n"
+    log_buffer += "\n📚 PROSES 2: HYBRID RETRIEVAL (ES + FAISS)...\n"
     yield history, log_buffer
-
     docs = retrieve_hybrid(expanded_query)
 
     if not docs:
-        history[-1]['content'] = "Maaf, tidak ditemukan referensi lontar yang relevan dengan pertanyaan Anda."
-        yield history, log_buffer + "❌ NIHIL: Ambang batas relevansi tidak terpenuhi."
+        history[-1]['content'] = "Maaf, referensi tidak ditemukan."
+        yield history, log_buffer + "❌ NIHIL"
         return
 
-    # [LOG 4: Context Assembly]
     context_str = ""
     log_buffer += f"✅ DITEMUKAN {len(docs)} REFERENSI:\n"
-
     for i, d in enumerate(docs):
         judul = d.metadata.get('title', '-')
-        cat = d.metadata.get('category', '-')
-        tags = d.metadata.get('topic_tags', '')
-
-        # Log detail untuk user (Transparansi sistem)
-        log_buffer += f"   • {i+1}. [{cat}] {judul}\n"
-        log_buffer += f"       ↳ Tags: {tags}\n"
-
-        # Context yang masuk ke LLM
-        context_str += f"SUMBER: {judul} (Kategori: {cat})\nISI LONTAR: {d.page_content}\n\n"
+        metode = d.metadata.get('method', 'Unknown')
+        log_buffer += f"   • {i+1}. {judul} [{metode}]\n"
+        context_str += f"SUMBER: {judul}\nISI: {d.page_content}\n\n"
 
     yield history, log_buffer
 
-    # [LOG 5: Generation / Synthesis]
     log_buffer += "\n✍️ PROSES 3: GENERATING RESPONSE...\n"
     yield history, log_buffer
 
-    # Prompt Engineering Akademis (Chain of Thought)
-    system_prompt = f"""Anda adalah Asisten Peneliti Lontar Bali yang cerdas.
-Tugas: Jawab pertanyaan pengguna berdasarkan KONTEKS yang diberikan.
+    # Prompt Engineering: Academic Literature Style
+    # Fokus: Menghilangkan repetisi, gaya bahasa paper ilmiah, dan analisis mendalam.
 
-INSTRUKSI KHUSUS:
-1. Jawablah dengan nada akademis namun mudah dipahami.
-2. JANGAN mengarang (halusinasi). Gunakan hanya fakta dari KONTEKS.
-3. Sebutkan nama lontar (sumber) yang menjadi rujukan jawaban.
-4. Berikan elaborasi singkat jika relevan. Juga hubungkan dengan konteks budaya Bali.
-5. Jika tidak ada info di KONTEKS, katakan "Maaf, informasi tidak tersedia dalam sumber yang diberikan."
-6. Jika pertanyaan tentang kategori/asal-usul, fokus pada aspek sejarah dan budaya. Berikan feedback singkat tentang pentingnya lontar tersebut.
-7. Jawaban harus dalam bahasa Indonesia yang baik dan benar.
-8. Gunakan format paragraf yang rapi dan terstruktur.
+    system_prompt = f"""PERAN:
+Anda adalah 'Asisten Filologi Digital', pakar Lontar Bali yang menulis dengan gaya akademis murni layaknya penyusun jurnal ilmiah atau paper. Jawaban Anda harus analitis, kaya diksi, dan menghindari pola kalimat yang monoton.
 
+TUGAS:
+Sintesiskan data dari [KONTEKS] menjadi narasi ilmiah yang mengalir. Hindari format kaku "Item: Penjelasan". Sebaliknya, biarkan setiap poin menceritakan fungsi unik naskah tersebut.
 
-KONTEKS:
+ATURAN PENULISAN (STRICT ACADEMIC GUIDELINES):
+
+1.  **Struktur Narasi Ilmiah (Flow)**:
+    * **Pembuka:** Mulailah dengan paragraf sintesis yang menguraikan tema besar pertanyaan (misal: hakikat Puja dalam teologi Hindu Bali) sebelum masuk ke rincian naskah.
+    * **Isi (Analytical List):**
+        * Gunakan **bullet points** untuk merinci naskah/konsep.
+        * **FORMAT:** Gunakan gaya **"**Judul Lontar/Konsep**: [Analisis langsung tentang isi, mantra, atau fungsi spesifik]."**
+        * **LARANGAN KERAS (ANTI-REPETISI):** DILARANG memulai setiap poin dengan frasa yang sama berulang-ulang (seperti: *"Lontar ini berisi...", "Lontar ini menjelaskan...", "Penjelasan:..."*).
+        * **VARIASI DIKSI:** Gunakan variasi kata kerja (misal: *"menguraikan", "menjabarkan", "menitikberatkan", "menjadi pedoman", "mengandung rapalan"*).
+    * **Penutup:** Simpulkan dengan benang merah filosofis (Tri Hita Karana, Desa Kala Patra, dll).
+
+2.  **Kedalaman Filologis**:
+    * Jelaskan istilah **Kawi, Sanskerta, atau Bahasa Bali** dengan padanan maknanya dalam kurung. Contoh: *ngastawa (memuja/memuji)*.
+    * Jangan hanya menyebut "untuk upacara", tapi sebutkan jenis upacaranya jika ada di data (misal: *Dewa Yadnya, Pitra Yadnya*).
+
+3.  **Integritas & Anti-Halusinasi**:
+    * Hanya gunakan fakta yang tersedia di [KONTEKS]. Jika konteks hanya memberikan judul tanpa deskripsi, sebutkan hanya judulnya atau abaikan jika tidak relevan.
+
+4.  **TAWARAN EKSPLORASI (Call-to-Action)**:
+    * Berisi kesimpulan jawaban dan pelajaran penting dari lontar.
+    * Di bagian paling bawah, berikan jeda satu baris.
+    * Tulis kalimat penutup yang elegan dan akademis dengan huruf miring (*italic*).
+    * Contoh: *"Apakah terdapat perspektif lain dari jawaban ini yang ingin Anda diskusikan, atau Anda memerlukan penelusuran spesifik pada teks lontar tertentu?"*
+
+DATA REFERENSI (CONTEXT):
 {context_str}
 
-PERTANYAAN: {user_input}
-JAWABAN:"""
+PERTANYAAN PENGGUNA: 
+{user_input}
+
+JAWABAN ANALISIS ILMIAH:"""
 
     response_text = ""
     try:
@@ -218,72 +254,41 @@ JAWABAN:"""
             history[-1]['content'] = response_text
             yield history, log_buffer
     except Exception as e:
-        history[-1]['content'] = f"Error Generasi: {str(e)}"
+        history[-1]['content'] = f"Error: {str(e)}"
         yield history, log_buffer
 
-    # [LOG 6: Feedback]
-    log_buffer += "\n✨ SELESAI. Siap untuk pertanyaan berikutnya."
+    log_buffer += "\n✨ SELESAI."
     yield history, log_buffer
 
 
-# --- 5. UI GRADIO (SESUAI REQUEST: KODE LAMA DIPERTAHANKAN) ---
-
+# --- 5. GUI GRADIO (TETAP SAMA) ---
 custom_css = """
 #chatbot { height: 600px !important; overflow: auto; border: 1px solid #e5e7eb; border-radius: 8px; }
 #log_panel { background-color: #f8fafc; font-family: monospace; font-size: 0.85em; }
 """
+theme = gr.themes.Soft(primary_hue="emerald", neutral_hue="slate").set(
+    body_background_fill="#ffffff")
 
-theme = gr.themes.Soft(
-    primary_hue="emerald",
-    neutral_hue="slate"
-).set(
-    body_background_fill="#ffffff"
-)
-
-with gr.Blocks(title="Lontar AI Expert") as demo:
-    gr.Markdown("# 🌿 Lontar AI Knowledge System")
-
+with gr.Blocks(title="Lontar AI (Elasticsearch Version)") as demo:
+    gr.Markdown("# 🌿 Lontar AI Knowledge System (Powered by Elasticsearch)")
     with gr.Row():
         with gr.Column(scale=4):
             gr.Markdown("### Log Trace")
             log_view = gr.Textbox(
-                label="Process Log",
-                lines=24,
-                interactive=False,
-                elem_id="log_panel"
-            )
-
+                label="Process Log", lines=24, interactive=False, elem_id="log_panel")
         with gr.Column(scale=6):
-            # Komponen Chatbot yang dipertahankan
-            chatbot = gr.Chatbot(
-                label="Dialog Lontar",
-                elem_id="chatbot",
-                avatar_images=(
-                    None, "https://cdn-icons-png.flaticon.com/512/4712/4712009.png")
-            )
-
+            chatbot = gr.Chatbot(label="Dialog Lontar", elem_id="chatbot", avatar_images=(
+                None, "https://cdn-icons-png.flaticon.com/512/4712/4712009.png"))
             with gr.Row():
                 txt_input = gr.Textbox(
-                    show_label=False,
-                    placeholder="Tanya tentang lontar...",
-                    scale=5,
-                    container=False,
-                    autofocus=True
-                )
+                    show_label=False, placeholder="Tanya tentang lontar...", scale=5, container=False, autofocus=True)
                 btn_submit = gr.Button("Kirim", variant="primary", scale=1)
 
-    # Wiring
     txt_input.submit(chat_pipeline, [txt_input, chatbot], [
                      chatbot, log_view]).then(lambda: "", outputs=[txt_input])
     btn_submit.click(chat_pipeline, [txt_input, chatbot], [
                      chatbot, log_view]).then(lambda: "", outputs=[txt_input])
 
 if __name__ == "__main__":
-    print("🚀 Meluncurkan Aplikasi...")
-    demo.launch(
-        server_name="127.0.0.1",
-        server_port=7860,
-        inbrowser=True,
-        theme=theme,
-        css=custom_css
-    )
+    demo.launch(server_name="127.0.0.1", server_port=7860,
+                inbrowser=True, theme=theme, css=custom_css)

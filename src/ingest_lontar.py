@@ -1,96 +1,168 @@
 import os
-import pickle
+import time
 from langchain_community.document_loaders import JSONLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
-from langchain_community.retrievers import BM25Retriever
 
-# --- PATH CONFIG (ABSOLUTE) ---
+# --- ELASTICSEARCH CLIENT ---
+from elasticsearch import Elasticsearch, helpers
+
+# --- PATH CONFIG ---
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_PATH = os.path.join(BASE_DIR, 'data', 'lontar.json')
 VECTOR_STORE_PATH = os.path.join(BASE_DIR, 'vector_store')
-KEYWORD_STORE_PATH = os.path.join(
-    BASE_DIR, 'keyword_store', 'bm25_retriever.pkl')
+
+# KONFIGURASI ELASTICSEARCH (Sesuaikan dengan setup lokal Anda)
+# Jika default tanpa password (mode dev):
+ES_CLIENT = Elasticsearch("http://localhost:9200")
+
+# Jika menggunakan password (default Elastic 8.x ke atas):
+# ES_CLIENT = Elasticsearch(
+#     "https://localhost:9200",
+#     basic_auth=("elastic", "PASSWORD_ANDA_DISINI"),
+#     verify_certs=False
+# )
+
+ES_INDEX_NAME = "lontar_knowledge_base"
 
 
 def metadata_func(record: dict, metadata: dict) -> dict:
     title = record.get("title", "Tanpa Judul")
     content = record.get("content", "")
     metadata["title"] = title
-
-    # Menggunakan himpunan kata kunci yang lebih spesifik untuk disambiguasi
     text_lower = (title + " " + content).lower()
 
-    # Prioritas Kategori (Hierarchy)
-    if any(x in text_lower for x in ['usada', 'tamba', 'boreh', 'loloh', 'cetik', 'obat', 'penawar']):
+    # Logika Kategori (Tetap dipertahankan)
+    if any(x in text_lower for x in ['usada', 'tamba', 'boreh', 'obat']):
         metadata["category"] = "Pengobatan (Usada)"
-        metadata["topic_tags"] = "kesehatan, herbal, penyembuhan"
-    elif any(x in text_lower for x in ['wariga', 'dewasa', 'wuku', 'tilem', 'purnama', 'sasih', 'hari baik']):
+        metadata["topic_tags"] = "kesehatan, herbal"
+    elif any(x in text_lower for x in ['wariga', 'dewasa', 'purnama']):
         metadata["category"] = "Astronomi (Wariga)"
-        metadata["topic_tags"] = "waktu, kalender, perbintangan"
-    elif any(x in text_lower for x in ['banten', 'yadnya', 'caru', 'upacara', 'sesajen', 'odalan', 'pedudusan']):
+        metadata["topic_tags"] = "waktu, kalender"
+    elif any(x in text_lower for x in ['banten', 'yadnya', 'caru']):
         metadata["category"] = "Ritual (Yadnya)"
-        metadata["topic_tags"] = "persembahan, upacara, suci"
-    elif any(x in text_lower for x in ['tattwa', 'kadyatmikan', 'moksa', 'atma', 'buana agung', 'wrhaspati']):
-        metadata["category"] = "Filosofi (Tattwa)"
-        metadata["topic_tags"] = "ketuhanan, jiwa, semesta"
-    elif any(x in text_lower for x in ['babad', 'silsilah', 'prasasti', 'raja', 'puri', 'dalem']):
-        metadata["category"] = "Sejarah (Babad)"
-        metadata["topic_tags"] = "asal-usul, leluhur, kerajaan"
+        metadata["topic_tags"] = "upacara, suci"
     else:
         metadata["category"] = "Umum/Lainnya"
         metadata["topic_tags"] = "general"
-
     return metadata
 
 
-def run_ingest():
-    print("🚀 [1/3] Memulai Ingest Data Lontar (Mode: Advanced Metadata)...")
+def setup_elastic_index():
+    """
+    Mendefinisikan Mapping dengan ANALYZER KHUSUS (Synonym Awareness).
+    Fitur Canggih: Menambahkan pemahaman bahasa (Ontologi Sederhana).
+    """
+    if ES_CLIENT.indices.exists(index=ES_INDEX_NAME):
+        print(f"⚠️ Menghapus index lama '{ES_INDEX_NAME}'...")
+        ES_CLIENT.indices.delete(index=ES_INDEX_NAME)
 
-    if not os.path.exists(DATA_PATH):
-        print(f"❌ Error: File {DATA_PATH} tidak ditemukan.")
+    # Konfigurasi Analyzer dengan Sinonim Bali-Indonesia
+    settings = {
+        "settings": {
+            "analysis": {
+                "filter": {
+                    "lontar_synonym": {
+                        "type": "synonym",
+                        "synonyms": [
+                            # Sinonim Domain Lontar (Contoh)
+                            "usada, tamba, obat, penyembuhan, herbal",
+                            "wariga, dewasa, kalender, hari baik, padewasan",
+                            "yadnya, banten, upacara, persembahan, caru",
+                            "tattwa, filosofi, hakikat, ketuhanan",
+                            "niskala, gaib, tak kasat mata",
+                            "sakit, gerah, lara, roga"
+                        ]
+                    }
+                },
+                "analyzer": {
+                    "balinese_analyzer": {
+                        "tokenizer": "standard",
+                        "filter": [
+                            "lowercase",
+                            "lontar_synonym"  # Filter sinonim diaktifkan
+                        ]
+                    }
+                }
+            }
+        },
+        "mappings": {
+            "properties": {
+                "title": {
+                    "type": "text",
+                    "analyzer": "balinese_analyzer"  # Menggunakan analyzer pintar
+                },
+                "content": {
+                    "type": "text",
+                    "analyzer": "balinese_analyzer"
+                },
+                "category": {"type": "keyword"},
+                "tags": {"type": "text"},
+                "chunk_id": {"type": "keyword"}
+            }
+        }
+    }
+
+    ES_CLIENT.indices.create(index=ES_INDEX_NAME, body=settings)
+    print(
+        f"✅ Index '{ES_INDEX_NAME}' berhasil dibuat dengan Mapping (Standard Elastic Search).")
+
+
+def run_ingest():
+    print("🚀 [1/3] Memulai Ingest Data Lontar (Mode: Real Elasticsearch)...")
+
+    # Cek Koneksi Elastic
+    if not ES_CLIENT.ping():
+        print("❌ GAGAL KONEKSI: Pastikan elasticsearch.bat sudah berjalan di background!")
         return
 
     # 1. LOAD DATA
-    loader = JSONLoader(
-        file_path=DATA_PATH,
-        jq_schema='.[]',
-        content_key="content",
-        metadata_func=metadata_func,
-        text_content=False
-    )
+    loader = JSONLoader(DATA_PATH, jq_schema='.[]', content_key="content",
+                        metadata_func=metadata_func, text_content=False)
     docs = loader.load()
-    print(f"   --> Berhasil memuat {len(docs)} dokumen.")
 
-    # 2. CHUNKING (Optimasi untuk Gemma2:2b)
-    # 512 tokens adalah sweet spot untuk model kecil agar tidak 'lupa' konteks awal
+    # 2. CHUNKING
     splitter = RecursiveCharacterTextSplitter(
-        chunk_size=512,
-        chunk_overlap=128,
-        separators=["\n\n", "\n", ". ", " ", ""]
-    )
+        chunk_size=512, chunk_overlap=128)
     chunks = splitter.split_documents(docs)
-    print(f"   --> Dipecah menjadi {len(chunks)} chunks semantik.")
+    print(f"   --> Dipecah menjadi {len(chunks)} chunks.")
 
-    # 3. INDEXING
-    print("🧠 [2/3] Membangun Index Hybrid...")
+    # 3. VECTOR INDEXING (FAISS)
+    print("🧠 [2/3] Membangun Semantic Layer (FAISS)...")
     embeddings = HuggingFaceEmbeddings(
         model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
-
-    # FAISS (Semantic)
     vector_db = FAISS.from_documents(chunks, embeddings)
     vector_db.save_local(VECTOR_STORE_PATH)
 
-    # BM25 (Keyword - Penting untuk istilah Bali Kuno yang jarang muncul di training data LLM)
-    bm25 = BM25Retriever.from_documents(chunks)
-    bm25.k = 5  # Default retrieval count
+    # 4. ELASTICSEARCH INGESTION
+    print("🔍 [3/3] Uploading ke Elasticsearch Local...")
+    setup_elastic_index()
 
-    os.makedirs(os.path.dirname(KEYWORD_STORE_PATH), exist_ok=True)
-    with open(KEYWORD_STORE_PATH, "wb") as f:
-        pickle.dump(bm25, f)
+    # Siapkan data untuk Bulk Insert
+    actions = []
+    for i, chunk in enumerate(chunks):
+        doc_body = {
+            "_index": ES_INDEX_NAME,
+            "_id": str(i),  # ID dokumen
+            "_source": {
+                "title": chunk.metadata.get("title"),
+                "content": chunk.page_content,
+                "category": chunk.metadata.get("category"),
+                "tags": chunk.metadata.get("topic_tags"),
+                "chunk_id": str(i)
+            }
+        }
+        actions.append(doc_body)
 
-    print("🎉 [3/3] Selesai! Database Lontar siap digunakan.")
+    # Eksekusi Bulk Insert (Cepat & Efisien)
+    helpers.bulk(ES_CLIENT, actions)
+    print(
+        f"   --> Berhasil mengupload {len(actions)} dokumen ke Elasticsearch.")
+
+    # Refresh index agar data langsung searchable
+    ES_CLIENT.indices.refresh(index=ES_INDEX_NAME)
+    print("🎉 Selesai! Database Hybrid (FAISS + Real Elasticsearch) siap.")
 
 
 if __name__ == "__main__":

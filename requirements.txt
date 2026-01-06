@@ -8,3 +8,4 @@ gradio
 python-dotenv
 pandas
 jq
+elasticsearch>=8.0.0
